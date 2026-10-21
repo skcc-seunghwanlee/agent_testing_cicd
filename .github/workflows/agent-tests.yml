@@ -1,0 +1,73 @@
+name: agent-tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 17 * * *"   # nightly L3 full run (UTC)
+  workflow_dispatch:
+
+env:
+  DEEPEVAL_TELEMETRY_OPT_OUT: "YES"
+
+jobs:
+  l1-l2:
+    # Required check. No LLM, no network, runs in seconds.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest tests -m "l1 or l2" -q
+
+  l3-smoke:
+    # Non-blocking on PRs: real LLM, smoke subset. Skipped for fork PRs (no secrets).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: l1-l2
+    runs-on: ubuntu-latest   # closed network: change to [self-hosted, <label>] so it can reach the in-house LLM
+    continue-on-error: true
+    env:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+      SMOKE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest tests/l3 -m l3 -q
+      - run: python scripts/compare.py --baseline baseline/l3.jsonl --margin 0.10
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: l3-smoke-results
+          path: results/
+
+  l3-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest   # same note as above
+    env:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest tests/l3 -m l3 -q
+      - run: python scripts/compare.py --baseline baseline/l3.jsonl --margin 0.10
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: l3-full-results
+          path: results/
