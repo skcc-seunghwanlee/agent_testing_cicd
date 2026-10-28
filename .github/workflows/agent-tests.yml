@@ -1,40 +1,71 @@
+# 에이전트 테스트 파이프라인
+#
+# 전체 흐름
+#   1. l1-l2     : LLM 없이 도는 테스트. 모든 PR/푸시에서 실행. 실패하면 이후 단계는 시작하지 않는다.
+#   2. l3-smoke  : PR에서 실제 LLM으로 골든 smoke 8건만 평가. 실패해도 머지를 막지 않는다(비차단).
+#   3. l3-full   : 매일 새벽(nightly) 또는 수동 실행 시 골든 24건 전체를 평가.
+#
+# 평가 방식(L3)
+#   pytest로 골든 케이스를 실행 -> results/l3_latest.jsonl에 결과 기록
+#   -> scripts/compare.py가 baseline/l3.jsonl과 비교해 회귀 여부 판정
+#   -> results/ 폴더를 아티팩트로 업로드
+#
+# 필요한 설정(레포 Settings > Secrets and variables > Actions)
+#   Secret   : LLM_API_KEY
+#   Variable : LLM_BASE_URL, LLM_MODEL
+
 name: agent-tests
 
+# 실행 시점
 on:
-  pull_request:
+  pull_request:              # PR 생성/갱신 시 -> l1-l2, l3-smoke
   push:
-    branches: [main]
+    branches: [main]         # main 푸시 시 -> l1-l2
   schedule:
-    - cron: "0 17 * * *"   # nightly L3 full run (UTC)
-  workflow_dispatch:
+    - cron: "0 17 * * *"     # 매일 17:00 UTC(한국 새벽 2시) -> l3-full
+  workflow_dispatch:         # Actions 탭에서 수동 실행 -> l3-full
 
+# 모든 job 공통 환경변수: DeepEval 텔레메트리 전송 끄기
 env:
   DEEPEVAL_TELEMETRY_OPT_OUT: "YES"
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # 1단계. L1(노드/툴 단위) + L2(그래프 경로/결정론 metric)
+  #   - LLM과 외부 네트워크를 쓰지 않아 몇 초 안에 끝난다.
+  #   - 머지 필수 체크로 쓰려면 레포 Settings > Branches(branch protection)에서
+  #     이 job(l1-l2)을 required status check로 지정해야 한다.
+  # ---------------------------------------------------------------------------
   l1-l2:
-    # Required check. No LLM, no network, runs in seconds.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v4          # 코드 내려받기
+      - uses: actions/setup-python@v5      # 파이썬 설치(+ pip 캐시)
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt
-      - run: python -m pytest tests -m "l1 or l2" -q
+      - run: pip install -r requirements.txt                 # 의존성 설치(버전 고정본)
+      - run: python -m pytest tests -m "l1 or l2" -q         # l1, l2 마커가 붙은 테스트만 실행
 
+  # ---------------------------------------------------------------------------
+  # 2단계. L3 smoke (PR 전용)
+  #   - 실제 LLM으로 smoke 표시된 골든 8건만 평가한다.
+  #   - 포크에서 온 PR은 시크릿에 접근할 수 없으므로 건너뛴다.
+  #   - continue-on-error: 이 job이 실패해도 PR 전체 결과는 실패로 만들지 않는다(비차단).
+  #     baseline과 마진이 안정되면 이 줄을 지워서 차단 방식으로 바꾼다.
+  # ---------------------------------------------------------------------------
   l3-smoke:
-    # Non-blocking on PRs: real LLM, smoke subset. Skipped for fork PRs (no secrets).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    needs: l1-l2
-    runs-on: ubuntu-latest   # closed network: change to [self-hosted, <label>] so it can reach the in-house LLM
+    needs: l1-l2                           # l1-l2가 통과해야 시작
+    # 폐쇄망 사내 LLM을 쓰려면 [self-hosted, 라벨]로 바꿔야 한다
+    # (GitHub 제공 러너는 사내망에 접근할 수 없다).
+    runs-on: ubuntu-latest
     continue-on-error: true
     env:
-      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
-      LLM_MODEL: ${{ vars.LLM_MODEL }}
-      SMOKE: "1"
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}    # 에이전트와 judge가 쓰는 API 키
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}     # OpenAI 호환 엔드포인트(사내 vLLM 등)
+      LLM_MODEL: ${{ vars.LLM_MODEL }}           # 에이전트 모델명
+      SMOKE: "1"                                 # 1이면 smoke 골든만 선택
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,17 +73,30 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      # 골든 케이스를 실제 LLM으로 실행하고 채점한다.
+      #   - 결정론 체크(도구 호출/권한/차단/인용)가 하나라도 틀리면 테스트 실패
+      #   - judge 점수는 results/l3_latest.jsonl에 기록만 한다
       - run: python -m pytest tests/l3 -m l3 -q
+      # 기록된 결과를 baseline과 비교한다. baseline 파일이 없으면 통과 처리된다.
+      #   - baseline에서 통과하던 결정론 체크가 실패하면 회귀
+      #   - judge 평균이 0.10 넘게 떨어지면 회귀(0.10은 임시값, variance.py로 측정 후 조정)
       - run: python scripts/compare.py --baseline baseline/l3.jsonl --margin 0.10
+      # 앞 단계가 실패해도 결과 파일을 업로드한다(원인 확인용).
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: l3-smoke-results
           path: results/
 
+  # ---------------------------------------------------------------------------
+  # 3단계. L3 full (nightly / 수동)
+  #   - 골든 24건 전체를 평가한다. PR에서는 돌지 않는다.
+  #   - smoke와 달리 SMOKE 변수가 없어서 전체 골든이 선택된다.
+  #   - 비용과 시간이 커서 매일 한 번만 돌린다.
+  # ---------------------------------------------------------------------------
   l3-full:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest   # same note as above
+    runs-on: ubuntu-latest                 # 위 l3-smoke와 같은 이유로 사내망이면 self-hosted로 변경
     env:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
@@ -64,8 +108,8 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python -m pytest tests/l3 -m l3 -q
-      - run: python scripts/compare.py --baseline baseline/l3.jsonl --margin 0.10
+      - run: python -m pytest tests/l3 -m l3 -q                                      # 전체 골든 평가
+      - run: python scripts/compare.py --baseline baseline/l3.jsonl --margin 0.10    # baseline 대비 회귀 판정
       - uses: actions/upload-artifact@v4
         if: always()
         with:
